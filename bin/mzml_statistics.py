@@ -23,6 +23,8 @@ def ms_dataframe(ms_path: str) -> None:
         "Retention_Time",
         "Exp_Mass_To_Charge",
         "AcquisitionDateTime",
+        "MZ_min",
+        "MZ_max",
     ]
 
     def parse_mzml(file_name: str, file_columns: list):
@@ -49,13 +51,16 @@ def ms_dataframe(ms_path: str) -> None:
                 tic = spectrum.getMetaValue("total ion current")
 
             if MSLevel == 1:
-                info_list = [id_, MSLevel, None, peak_per_ms, bpc, tic, rt, None, acquisition_datetime]
+                info_list = [id_, MSLevel, None, peak_per_ms, bpc, tic, rt, None, acquisition_datetime, None, None]
             elif MSLevel == 2:
-                charge_state = spectrum.getPrecursors()[0].getCharge()
-                emz = spectrum.getPrecursors()[0].getMZ() if spectrum.getPrecursors()[0].getMZ() else None
-                info_list = [id_, MSLevel, charge_state, peak_per_ms, bpc, tic, rt, emz, acquisition_datetime]
+                precursor = spectrum.getPrecursors()[0]
+                charge_state = precursor.getCharge()
+                emz = precursor.getMZ() if precursor.getMZ() else None
+                mz_min = emz - precursor.getIsolationWindowLowerOffset()
+                mz_max = emz + precursor.getIsolationWindowUpperOffset()
+                info_list = [id_, MSLevel, charge_state, peak_per_ms, bpc, tic, rt, emz, acquisition_datetime, mz_min, mz_max]
             else:
-                info_list = [id_, MSLevel, None, None, None, None, rt, None, acquisition_datetime]
+                info_list = [id_, MSLevel, None, None, None, None, rt, None, acquisition_datetime, mz_min, mz_max]
 
             info.append(info_list)
 

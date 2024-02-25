@@ -43,8 +43,9 @@ def cli():
 @click.option("--charge", "-c")
 @click.option("--missed_cleavages", "-m")
 @click.option("--qvalue_threshold", "-q", type=float)
+@click.option("--generate_psm", "-g")
 @click.pass_context
-def convert(ctx, folder, exp_design, dia_params, diann_version, charge, missed_cleavages, qvalue_threshold):
+def convert(ctx, folder, exp_design, dia_params, diann_version, charge, missed_cleavages, qvalue_threshold, generate_psm):
     """
     Convert DIA-NN output to MSstats, Triqler or mzTab.
      The output formats are
@@ -64,6 +65,8 @@ def convert(ctx, folder, exp_design, dia_params, diann_version, charge, missed_c
     :type missed_cleavages: int
     :param qvalue_threshold: Threshold for filtering q value
     :type qvalue_threshold: float
+    :param generate_psm: Whether to generate psm between ions in report and spectrum
+    :type generate_psm: bool
     """
     logger.debug(f"Revision {REVISION}")
     logger.debug("Reading input files...")
@@ -148,6 +151,7 @@ def convert(ctx, folder, exp_design, dia_params, diann_version, charge, missed_c
         missed_cleavages=missed_cleavages,
         dia_params=dia_params,
         out=mztab_out,
+        psm=generate_psm,
     )
 
 
@@ -262,7 +266,7 @@ class DiannDirectory:
             raise ValueError(f"Unsupported DIANN version {self.diann_version}")
 
     def convert_to_mztab(
-        self, report, f_table, charge: int, missed_cleavages: int, dia_params: List[Any], out: os.PathLike
+        self, report, f_table, charge: int, missed_cleavages: int, dia_params: List[Any], out: os.PathLike, psm: bool
     ) -> None:
         logger.info("Converting to mzTab")
         self.validate_diann_version()
@@ -304,7 +308,7 @@ class DiannDirectory:
         precursor_list = list(report["Precursor.Id"].unique())
         PEH = mztab_PEH(report, pr, precursor_list, index_ref, database)
         del pr
-        PSH = mztab_PSH(report, str(self.base_path), database)
+        PSH = mztab_PSH(report, str(self.base_path), database, psm)
         del report
         MTD.loc["", :] = ""
         PRH.loc[len(PRH) + 1, :] = ""
@@ -326,7 +330,7 @@ class DiannDirectory:
             "Protein.Ids",
             "First.Protein.Description",
             "PG.MaxLFQ",
-            "RT.Start",
+            "RT",
             "Global.Q.Value",
             "Lib.Q.Value",
             "PEP",
@@ -769,7 +773,7 @@ def mztab_PEH(
         .agg(
             {
                 "Q.Value": "min",
-                "RT.Start": "mean",
+                "RT": "mean",
                 "Global.Q.Value": "min",
                 "Lib.Q.Value": "min",
                 "Calculate.Precursor.Mz": "mean",
@@ -780,7 +784,7 @@ def mztab_PEH(
             columns={
                 "precursor.Index": "pr_id",
                 "Q.Value": "best_search_engine_score[1]",
-                "RT.Start": "retention_time",
+                "RT": "retention_time",
                 "Global.Q.Value": "opt_global_q-value",
                 "Lib.Q.Value": "opt_global_SpecEValue_score",
                 "Calculate.Precursor.Mz": "mass_to_charge",
@@ -805,7 +809,7 @@ def mztab_PEH(
     return out_mztab_PEH
 
 
-def mztab_PSH(report, folder, database):
+def mztab_PSH(report, folder, database, psm):
     """
     Construct PSH sub-table.
 
@@ -817,6 +821,8 @@ def mztab_PSH(report, folder, database):
     :type folder: str
     :param database: Path to fasta file
     :type database: str
+    :param psm: Whether generate psm
+    :type psm: bool
     :return: PSH sub-table
     :rtype: pandas.core.frame.DataFrame
     """
@@ -834,37 +840,66 @@ def mztab_PSH(report, folder, database):
 
         return files[0]
 
-    out_mztab_PSH = pd.DataFrame()
-    for n, group in report.groupby(["Run"]):
-        if isinstance(n, tuple) and len(n) == 1:
-            # This is here only to support versions of pandas where the groupby
-            # key is a tuple.
-            # related: https://github.com/pandas-dev/pandas/pull/51817
-            n = n[0]
+    if psm:
+        out_mztab_PSH, PSH = pd.DataFrame(), pd.DataFrame()
+        for n, group in report.groupby(["Run"]):
+            logger.debug(f"Generate PSM between ions and spectrum {n[0]}...")
+            if isinstance(n, tuple) and len(n) == 1:
+                # This is here only to support versions of pandas where the groupby
+                # key is a tuple.
+                # related: https://github.com/pandas-dev/pandas/pull/51817
+                n = n[0]
 
-        file = __find_info(folder, n)
-        target = pd.read_csv(file, sep="\t")
-        group.sort_values(by="RT.Start", inplace=True)
-        target = target[["Retention_Time", "SpectrumID", "Exp_Mass_To_Charge"]]
-        target.columns = ["RT.Start", "opt_global_spectrum_reference", "exp_mass_to_charge"]
-        # Standardize spectrum identifier format for bruker data
-        if type(target.loc[0, "opt_global_spectrum_reference"]) != str:
-            target.loc[:, "opt_global_spectrum_reference"] = "scan=" + target.loc[
-                :, "opt_global_spectrum_reference"
-            ].astype(str)
+            file = __find_info(folder, n)
+            target = pd.read_csv(file, sep="\t")
+            target = target[target["MSLevel"] == 2]
+            target = target[["Retention_Time", "SpectrumID", "Exp_Mass_To_Charge", "MZ_min", "MZ_max"]]
+            target.columns = ["RT", "opt_global_spectrum_reference", "exp_mass_to_charge", "MZ_min", "MZ_max"]
+            # Match retention time in minutes
+            target.loc[:, "RT"] = target.apply(lambda x: x["RT"] / 60, axis=1)
+            target = target.reset_index(drop=True)
+            # Standardize spectrum identifier format for bruker data
+            if type(target.loc[0, "opt_global_spectrum_reference"]) != str:
+                target.loc[:, "opt_global_spectrum_reference"] = "scan=" + target.loc[
+                    :, "opt_global_spectrum_reference"
+                ].astype(str)
 
-        # TODO seconds returned from precursor.getRT()
-        target.loc[:, "RT.Start"] = target.apply(lambda x: x["RT.Start"] / 60, axis=1)
-        out_mztab_PSH = pd.concat([out_mztab_PSH, pd.merge_asof(group, target, on="RT.Start", direction="nearest")])
+            target_copy = target.copy(deep=True)
+            target_indexes = list()
+            # Get ions in MS2 that in the precursor isolation window, and return the index
+            # of the ion which has nearest RT to the ion in report
+            def match_mz(mz, rt):
+                match = target[(mz >= target["MZ_min"]) & (mz <= target["MZ_max"])]
+                if len(match) > 0:
+                    abs_diff = match["RT"].sub(rt).abs()
+                    nearst_rowindex = abs_diff.idxmin()
+                    return nearst_rowindex
+                else:
+                    exit(f"Ion mass to charge {mz} is not in the precursor isolation window, break!")
+
+            for i in group[["Calculate.Precursor.Mz", "RT"]].itertuples(index=False):
+                nearst_rowindex = match_mz(i[0], i[1])
+                # Remove the MS2 ion has been mapped
+                target = target.drop(nearst_rowindex)
+                target_indexes.append(nearst_rowindex)
+
+            df_right = target_copy.loc[target_indexes,:][["opt_global_spectrum_reference", "exp_mass_to_charge", "MZ_min", "MZ_max"]]
+            df_right = df_right.reset_index()
+            group = group.reset_index()
+            df = pd.concat([group, df_right], axis = 1)
+            out_mztab_PSH = pd.concat([out_mztab_PSH, df])
+        out_mztab_PSH = out_mztab_PSH.reset_index()
+    else:
+        report.loc[:,["opt_global_spectrum_reference", "exp_mass_to_charge"]] = ["null", "null"]
+        out_mztab_PSH = report.reset_index()
     del report
-
     ## Score at PSM level: Q.Value
     out_mztab_PSH = out_mztab_PSH[
         [
             "Stripped.Sequence",
             "Protein.Ids",
             "Q.Value",
-            "RT.Start",
+            "RT",
             "Precursor.Charge",
             "Calculate.Precursor.Mz",
             "exp_mass_to_charge",
@@ -916,11 +951,12 @@ def mztab_PSH(report, folder, database):
     out_mztab_PSH.loc[:, "modifications"] = out_mztab_PSH.apply(
         lambda x: find_modification(x["opt_global_cv_MS:1000889_peptidoform_sequence"]), axis=1, result_type="expand"
     )
-
-    out_mztab_PSH.loc[:, "spectra_ref"] = out_mztab_PSH.apply(
-        lambda x: "ms_run[{}]:".format(x["ms_run"]) + x["opt_global_spectrum_reference"], axis=1, result_type="expand"
-    )
-
+    if psm:
+        out_mztab_PSH.loc[:, "spectra_ref"] = out_mztab_PSH.apply(
+            lambda x: "ms_run[{}]:".format(int(x["ms_run"])) + str(x["opt_global_spectrum_reference"]), axis=1, result_type="expand"
+        )
+    else:
+        out_mztab_PSH.loc[:, "spectra_ref"] = "null"
     out_mztab_PSH.loc[:, "opt_global_cv_MS:1000889_peptidoform_sequence"] = out_mztab_PSH.apply(
         lambda x: AASequence.fromString(x["opt_global_cv_MS:1000889_peptidoform_sequence"]).toString(),
         axis=1,
@@ -936,7 +972,8 @@ def mztab_PSH(report, folder, database):
         col for col in out_mztab_PSH.columns if col.startswith("opt_")
     ]
     out_mztab_PSH = out_mztab_PSH[new_cols]
-    # out_mztab_PSH.to_csv("./out_psms.mztab", sep=",", index=False)
+    # out_mztab_PSH.to_csv("./out_psms_myway.mztab", sep=",", index=False)
+    out_mztab_PSH.to_csv("mapped_psm_RT.tsv", sep="\t", index=False)
 
     return out_mztab_PSH
 
@@ -995,7 +1032,7 @@ def match_in_report(report, target, max_, flag, level):
         PEH_params = []
         for i in range(1, max_ + 1):
             match = result[result["study_variable"] == i]
-            PEH_params.extend([match["Precursor.Normalised"].mean(), "null", "null", "null", match["RT.Start"].mean()])
+            PEH_params.extend([match["Precursor.Normalised"].mean(), "null", "null", "null", match["RT"].mean()])
 
         return tuple(PEH_params)
 
@@ -1189,7 +1226,7 @@ def per_peptide_study_report(report: pd.DataFrame) -> pd.DataFrame:
     """
     pep_study_grouped = (
         report.groupby(["study_variable", "precursor.Index"])
-        .agg({"Precursor.Normalised": ["mean", "std", "sem"], "RT.Start": ["mean"], "Calculate.Precursor.Mz": ["mean"]})
+        .agg({"Precursor.Normalised": ["mean", "std", "sem"], "RT": ["mean"], "Calculate.Precursor.Mz": ["mean"]})
         .reset_index()
         .pivot(columns=["study_variable"], index="precursor.Index")
         .reset_index()
@@ -1206,8 +1243,8 @@ def per_peptide_study_report(report: pd.DataFrame) -> pd.DataFrame:
     #     "Precursor.Normalised::std::2",
     #     "Precursor.Normalised::sem::1",
     #     "Precursor.Normalised::sem::2",
-    #     "RT.Start::mean::1",
-    #     "RT.Start::mean::2",
+    #     "RT::mean::1",
+    #     "RT::mean::2",
     # ]
     # So the right names need to be given and the table can be joined with the other one
     subname_mapper = {
@@ -1216,7 +1253,7 @@ def per_peptide_study_report(report: pd.DataFrame) -> pd.DataFrame:
         "Precursor.Normalised::std": "peptide_abundance_stdev_study_variable",
         "Precursor.Normalised::sem": "peptide_abundance_std_error_study_variable",
         "Calculate.Precursor.Mz::mean": "opt_global_mass_to_charge_study_variable",
-        "RT.Start::mean": "opt_global_retention_time_study_variable",
+        "RT::mean": "opt_global_retention_time_study_variable",
     }
     name_mapper = name_mapper_builder(subname_mapper)
 
