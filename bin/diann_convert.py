@@ -9,6 +9,7 @@ Revisions:
 import logging
 import os
 import re
+import bisect
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, List, Tuple, Dict, Set, Union
@@ -857,32 +858,44 @@ def mztab_PSH(report, folder, database, psm):
             target.columns = ["RT", "opt_global_spectrum_reference", "exp_mass_to_charge", "MZ_min", "MZ_max"]
             # Match retention time in minutes
             target.loc[:, "RT"] = target.apply(lambda x: x["RT"] / 60, axis=1)
-            target = target.reset_index(drop=True)
+            target = target.sort_values("RT", inplace=False)
+            target = target.reset_index()
             # Standardize spectrum identifier format for bruker data
             if type(target.loc[0, "opt_global_spectrum_reference"]) != str:
                 target.loc[:, "opt_global_spectrum_reference"] = "scan=" + target.loc[
                     :, "opt_global_spectrum_reference"
                 ].astype(str)
 
-            # Get ions of MS2 that in the precursor isolation window, return the remaining
-            # MS2 ions and the ion matched
-            def match_mz(mz, rt, target):
-                matches = (target["MZ_min"] <= mz) & (target["MZ_max"] >= mz)
-                if len(matches) > 0:
-                    abs_diff = np.abs(target.loc[matches, "RT"] - rt)
-                    nearst_rowindex = target.loc[matches].index[abs_diff.argmin()]
-                    target.drop(nearst_rowindex, inplace=True)
-                    return target, target.iloc[nearst_rowindex]
+            # Get ions of MS2 that in the precursor isolation window, return the retention time of
+            # ions have been mapped
+            def match_mz(mz, rt, target, rt_list):
+                matches = target[(target["MZ_min"] <= mz) & (target["MZ_max"] >= mz)]
+                rts = list(set(matches.index).difference(rt_list))
+                if len(rts) > 0:
+                    position = bisect.bisect_left(rts, rt)
+                    if position == len(rts):
+                        nearest_rowindex = position - 1
+                    else:
+                        diff_left = abs(rts[position - 1] - rt)
+                        diff_right = abs(rts[position] - rt)
+                        if diff_left <= diff_right:
+                            nearest_rowindex = position - 1
+                        else:
+                            nearest_rowindex = position
+                    matched_rt = rts[nearest_rowindex]
+                    rt_list.append(matched_rt)
+                    return rt_list
                 else:
                     exit(f"Ion mass to charge {mz} is not in the precursor isolation window, break!")
 
+            # Set RT as index to slice the spectrum dataframe
+            target = target.set_index("RT")
             to_append = list()
             for i in group[["Calculate.Precursor.Mz", "RT"]].itertuples(index=False):
-                target, matched_row = match_mz(i[0], i[1], target)
-                to_append.append(matched_row)
+                to_append = match_mz(i[0], i[1], target, to_append)
 
-            df_right = pd.DataFrame(to_append)[["opt_global_spectrum_reference", "exp_mass_to_charge", "MZ_min", "MZ_max"]]
-            df_right = df_right.reset_index()
+            df_right = target.loc[to_append, ["opt_global_spectrum_reference", "exp_mass_to_charge", "MZ_min", "MZ_max"]]
+            df_right = df_right.reset_index(drop=True)
             group = group.reset_index()
             df = pd.concat([group, df_right], axis = 1)
             out_mztab_PSH = pd.concat([out_mztab_PSH, df])
@@ -970,7 +983,7 @@ def mztab_PSH(report, folder, database, psm):
         col for col in out_mztab_PSH.columns if col.startswith("opt_")
     ]
     out_mztab_PSH = out_mztab_PSH[new_cols]
-    # out_mztab_PSH.to_csv("./out_psms.mztab", sep=",", index=False)
+    out_mztab_PSH.to_csv("./out_psms.mztab", sep="\t", index=False)
 
     return out_mztab_PSH
 
