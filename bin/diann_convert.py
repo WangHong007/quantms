@@ -864,26 +864,24 @@ def mztab_PSH(report, folder, database, psm):
                     :, "opt_global_spectrum_reference"
                 ].astype(str)
 
-            target_copy = target.copy(deep=True)
-            target_indexes = list()
-            # Get ions in MS2 that in the precursor isolation window, and return the index
-            # of the ion which has nearest RT to the ion in report
-            def match_mz(mz, rt):
-                match = target[(mz >= target["MZ_min"]) & (mz <= target["MZ_max"])]
-                if len(match) > 0:
-                    abs_diff = match["RT"].sub(rt).abs()
-                    nearst_rowindex = abs_diff.idxmin()
-                    return nearst_rowindex
+            # Get ions of MS2 that in the precursor isolation window, return the remaining
+            # MS2 ions and the ion matched
+            def match_mz(mz, rt, target):
+                matches = (target["MZ_min"] <= mz) & (target["MZ_max"] >= mz)
+                if len(matches) > 0:
+                    abs_diff = np.abs(target.loc[matches, "RT"] - rt)
+                    nearst_rowindex = target.loc[matches].index[abs_diff.argmin()]
+                    target.drop(nearst_rowindex, inplace=True)
+                    return target, target.iloc[nearst_rowindex]
                 else:
                     exit(f"Ion mass to charge {mz} is not in the precursor isolation window, break!")
 
+            to_append = list()
             for i in group[["Calculate.Precursor.Mz", "RT"]].itertuples(index=False):
-                nearst_rowindex = match_mz(i[0], i[1])
-                # Remove the MS2 ion has been mapped
-                target = target.drop(nearst_rowindex)
-                target_indexes.append(nearst_rowindex)
+                target, matched_row = match_mz(i[0], i[1], target)
+                to_append.append(matched_row)
 
-            df_right = target_copy.loc[target_indexes,:][["opt_global_spectrum_reference", "exp_mass_to_charge", "MZ_min", "MZ_max"]]
+            df_right = pd.DataFrame(to_append)[["opt_global_spectrum_reference", "exp_mass_to_charge", "MZ_min", "MZ_max"]]
             df_right = df_right.reset_index()
             group = group.reset_index()
             df = pd.concat([group, df_right], axis = 1)
@@ -972,8 +970,7 @@ def mztab_PSH(report, folder, database, psm):
         col for col in out_mztab_PSH.columns if col.startswith("opt_")
     ]
     out_mztab_PSH = out_mztab_PSH[new_cols]
-    # out_mztab_PSH.to_csv("./out_psms_myway.mztab", sep=",", index=False)
-    out_mztab_PSH.to_csv("mapped_psm_RT.tsv", sep="\t", index=False)
+    # out_mztab_PSH.to_csv("./out_psms.mztab", sep=",", index=False)
 
     return out_mztab_PSH
 
